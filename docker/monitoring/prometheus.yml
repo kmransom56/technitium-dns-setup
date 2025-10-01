@@ -1,0 +1,48 @@
+# Prometheus configuration for Technitium DNS monitoring
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'technitium-dns-monitor'
+
+rule_files:
+  - "dns_alerts.yml"
+
+scrape_configs:
+  # Technitium DNS Server metrics
+  - job_name: 'technitium-dns'
+    static_configs:
+      - targets: ['technitium-dns:5380']
+    metrics_path: '/api/admin/stats/get'
+    params:
+      token: ['your-api-token']
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  # System metrics from node exporter (if available)
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    scrape_interval: 15s
+
+  # Docker container metrics (if available)
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+    scrape_interval: 15s
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+# Custom DNS monitoring rules
+rule_files:
+  - "rules/*.yml"

@@ -1,0 +1,295 @@
+# Technitium DNS Server - Docker Compose Configuration
+# Complete setup with SSL certificates, monitoring, and backup
+
+version: '3.8'
+
+services:
+  technitium-dns:
+    image: technitium/dns-server:latest
+    container_name: technitium-dns
+    hostname: dns.netintegrate.net
+    restart: unless-stopped
+    
+    ports:
+      # Standard DNS
+      - "53:53/udp"
+      - "53:53/tcp"
+      # Web Console
+      - "5380:5380/tcp"
+      # DNS-over-TLS
+      - "853:853/tcp"
+      # DNS-over-HTTPS
+      - "443:443/tcp"
+      # DNS-over-QUIC
+      - "853:853/udp"
+    
+    volumes:
+      # Configuration and data persistence
+      - technitium-config:/etc/dns
+      # SSL certificates
+      - ./certificates:/etc/dns/certificates:ro
+      # Custom configuration
+      - ./config/dns.config:/etc/dns/config/dns.config:ro
+      # Log directory
+      - ./logs:/etc/dns/logs
+    
+    environment:
+      # Basic configuration
+      - DNS_SERVER_DOMAIN=dns.netintegrate.net
+      - DNS_SERVER_ADMIN_PASSWORD=${DNS_ADMIN_PASSWORD:-change-this-password}
+      
+      # Web console settings
+      - DNS_SERVER_WEB_SERVICE_HTTP_PORT=5380
+      - DNS_SERVER_WEB_SERVICE_ENABLE_HTTPS=true
+      - DNS_SERVER_WEB_SERVICE_HTTPS_PORT=5443
+      
+      # Performance settings
+      - DNS_SERVER_RECURSION_TIMEOUT=5000
+      - DNS_SERVER_RECURSION_RETRIES=2
+      - DNS_SERVER_CACHE_MAXIMUM_ENTRIES=100000
+      
+      # Security settings
+      - DNS_SERVER_ENABLE_DNSSEC=true
+      - DNS_SERVER_ENABLE_DNS_REBIND_PROTECTION=true
+      
+      # Logging
+      - DNS_SERVER_LOG_QUERIES=true
+      - DNS_SERVER_LOG_LEVEL=Info
+    
+    healthcheck:
+      test: ["CMD", "dig", "@127.0.0.1", "google.com"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    
+    labels:
+      - "com.docker.compose.service=technitium-dns"
+      - "maintainer=Technitium DNS Setup"
+    
+    # Security settings
+    security_opt:
+      - no-new-privileges:true
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.1'
+
+  # Certificate renewal service
+  cert-renewer:
+    image: certbot/certbot:latest
+    container_name: dns-cert-renewer
+    restart: unless-stopped
+    
+    volumes:
+      - ./certificates:/etc/letsencrypt
+      - ./scripts:/scripts:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    
+    environment:
+      - DOMAINS=dns.netintegrate.net,dns2.netintegrate.net
+      - EMAIL=admin@netintegrate.net
+      - CERT_PASSWORD=${CERT_PASSWORD:-secure-cert-password}
+    
+    entrypoint: |
+      sh -c '
+        echo "Starting certificate renewal service..."
+        while true; do
+          echo "Checking certificate renewal..."
+          
+          # Renew certificates
+          certbot renew --quiet --no-self-upgrade
+          
+          # Convert to PFX format for Technitium
+          for domain in $$DOMAINS; do
+            if [ -f "/etc/letsencrypt/live/$$domain/fullchain.pem" ]; then
+              echo "Converting certificate for $$domain..."
+              openssl pkcs12 -export \
+                -out "/etc/letsencrypt/live/$$domain/$${domain}_full_chain.pfx" \
+                -inkey "/etc/letsencrypt/live/$$domain/privkey.pem" \
+                -in "/etc/letsencrypt/live/$$domain/fullchain.pem" \
+                -password pass:$$CERT_PASSWORD
+              
+              # Copy to certificates directory
+              cp "/etc/letsencrypt/live/$$domain/$${domain}_full_chain.pfx" "/etc/letsencrypt/"
+            fi
+          done
+          
+          # Restart DNS server to reload certificates
+          if command -v docker >/dev/null 2>&1; then
+            docker restart technitium-dns
+          fi
+          
+          # Wait 24 hours before next check
+          sleep 86400
+        done
+      '
+    
+    depends_on:
+      - technitium-dns
+
+  # Monitoring and metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: dns-prometheus
+    restart: unless-stopped
+    
+    ports:
+      - "9090:9090"
+    
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    
+    labels:
+      - "com.docker.compose.service=monitoring"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: dns-grafana
+    restart: unless-stopped
+    
+    ports:
+      - "3000:3000"
+    
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    
+    depends_on:
+      - prometheus
+    
+    labels:
+      - "com.docker.compose.service=monitoring"
+
+  # Backup service
+  backup:
+    image: alpine:latest
+    container_name: dns-backup
+    restart: unless-stopped
+    
+    volumes:
+      - technitium-config:/backup/config:ro
+      - ./certificates:/backup/certificates:ro
+      - ./backups:/backups
+      - ./scripts:/scripts:ro
+    
+    environment:
+      - BACKUP_SCHEDULE=${BACKUP_SCHEDULE:-@daily}
+      - BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS:-30}
+      - BACKUP_ENCRYPTION_PASSWORD=${BACKUP_PASSWORD:-backup-password}
+    
+    entrypoint: |
+      sh -c '
+        echo "Installing backup dependencies..."
+        apk add --no-cache dcron tar gzip openssl
+        
+        # Create backup script
+        cat > /usr/local/bin/backup-dns.sh << "EOF"
+        #!/bin/sh
+        BACKUP_DATE=$(date +%Y%m%d_%H%M%S)
+        BACKUP_FILE="/backups/technitium-dns-backup-$BACKUP_DATE.tar.gz"
+        
+        echo "Starting backup: $BACKUP_FILE"
+        
+        # Create backup archive
+        tar -czf "$BACKUP_FILE.tmp" \
+          -C /backup config certificates
+        
+        # Encrypt backup (optional)
+        if [ -n "$BACKUP_ENCRYPTION_PASSWORD" ]; then
+          openssl enc -aes-256-cbc -salt \
+            -in "$BACKUP_FILE.tmp" \
+            -out "$BACKUP_FILE.enc" \
+            -pass pass:"$BACKUP_ENCRYPTION_PASSWORD"
+          rm "$BACKUP_FILE.tmp"
+          mv "$BACKUP_FILE.enc" "$BACKUP_FILE"
+        else
+          mv "$BACKUP_FILE.tmp" "$BACKUP_FILE"
+        fi
+        
+        echo "Backup completed: $BACKUP_FILE"
+        
+        # Cleanup old backups
+        find /backups -name "technitium-dns-backup-*.tar.gz*" \
+          -mtime +${BACKUP_RETENTION_DAYS:-30} -delete
+        
+        echo "Old backups cleaned up"
+        EOF
+        
+        chmod +x /usr/local/bin/backup-dns.sh
+        
+        # Setup cron job
+        echo "${BACKUP_SCHEDULE:-0 2 * * *} /usr/local/bin/backup-dns.sh" | crontab -
+        
+        echo "Starting cron daemon..."
+        crond -f -l 2
+      '
+    
+    depends_on:
+      - technitium-dns
+
+  # Log aggregation
+  fluentd:
+    image: fluent/fluentd:v1.16-debian-1
+    container_name: dns-fluentd
+    restart: unless-stopped
+    
+    ports:
+      - "24224:24224"
+      - "24224:24224/udp"
+    
+    volumes:
+      - ./monitoring/fluentd/fluent.conf:/fluentd/etc/fluent.conf:ro
+      - ./logs:/var/log/technitium:ro
+      - fluentd-data:/fluentd/log
+    
+    environment:
+      - FLUENTD_CONF=fluent.conf
+      - FLUENTD_OPT=-v
+    
+    labels:
+      - "com.docker.compose.service=logging"
+
+volumes:
+  technitium-config:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data
+  
+  prometheus-data:
+    driver: local
+  
+  grafana-data:
+    driver: local
+  
+  fluentd-data:
+    driver: local
+
+networks:
+  default:
+    name: technitium-dns-network
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
